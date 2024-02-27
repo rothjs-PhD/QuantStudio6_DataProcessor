@@ -1,0 +1,184 @@
+---
+title: "ChatGPT-qPCR-Processor"
+author: "Jacob Roth"
+date: "2024-02-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# results <- "qPCR_20240201_1/20240208_1515_JSRe0151_151303_Results_20240208 165817.csv"
+# overview <- "JSRe0151-P_DNA_qPCR-TidyqPCR_20240208_jsr.xlsx"
+# exp <- "JSRe0151_20240201"
+
+results <- "qPCR_20240223_1/20230223_JSRe0151_154845_20240223_181819_Results_20240223 200347.csv"
+overview <- "JSRe0151-P_DNA_qPCR-TidyqPCR_jsr_20240212-2.xlsx"
+exp <- "JSRe0151_20240208"
+
+```
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+
+# Read the data
+data_qPCR <- read.csv("2-data_raw/qPCR_20240223_1/20230223_JSRe0151_154845_20240223_181819_Results_20240223 200347.csv",
+                     skip = 21)
+
+# data_qPCR <- read.csv(paste("2-data_raw/",results, sep = ""),
+                     # skip = 21)
+data_qPCR <- data_qPCR %>%
+  rename(target = Target)  # Replace 'gene_target' with the actual column name
+data_qPCR <- data_qPCR %>%
+  rename(sample = Sample)  # Replace 'gene_target' with the actual column name
+
+data_qPCR$sample_target <- paste(data_qPCR$sample, data_qPCR$target, sep="; ")
+
+```
+
+```{r remove primer dilutions}
+
+data_qPCR <- data_qPCR %>%
+  filter(!grepl("_200", sample)) %>%
+  filter(!grepl("_2000", sample))
+
+```
+
+
+```{r Read metadata}
+data_qPCR_primers <- read_excel(paste("1-notes/",overview, sep = ""), 
+                              sheet = "PrimerEfficiency")
+data_qPCR_primers <- dplyr::select(data_qPCR_primers, c(target,Efficiency_target)) %>% unique() %>%
+  drop_na()
+
+
+
+data_qPCR_overview <- read_excel(paste("1-notes/",overview, sep = ""), 
+                              sheet = "overview")
+data_qPCR_overview <- data_qPCR_overview %>%
+  select(-c(sample,target))
+
+# 
+# gene_house <- "Actin_JSRi032-033"
+# sample_control1 <- "JSRp033_PolyA_20"
+# sample_control2 <- "DMSO-4day_PolyA_20"
+
+
+```
+
+```{r Align identifiers}
+
+#add metadata for relevent controls
+data_qPCR <- data_qPCR %>%
+  left_join(data_qPCR_overview, by = "sample_target")
+
+
+#add primer efficiency column for target
+data_qPCR <- data_qPCR %>%
+  left_join(data_qPCR_primers, by = "target")
+
+#add primer efficiency column for control
+data_qPCR <- merge(data_qPCR, data_qPCR_primers, by.x = "gene_house1", by.y = "target", all.x = TRUE)
+
+data_qPCR <- data_qPCR %>%
+  rename(Efficiency_target = Efficiency_target.x)
+
+data_qPCR <- data_qPCR %>%
+  rename(Efficiency_control = Efficiency_target.y)
+
+```
+
+```{r Processing}
+
+# Calculate the control Cq for each sample and target
+data_qPCR_control_cq <- data_qPCR %>%
+  group_by(sample) %>%
+  summarise(Cq_control = mean(as.numeric(Cq[gene_house1 == target], na.rm = FALSE)), .groups = 'drop')
+
+# Join this control Cq back to the original dataset
+data_qPCR <- data_qPCR %>%
+  left_join(data_qPCR_control_cq, by = c("sample"))
+
+```
+
+```{r Calc deltaCq}
+data_qPCR$Cq <- as.numeric(data_qPCR$Cq)
+data_qPCR$Cq_control <- as.numeric(data_qPCR$Cq_control)
+data_qPCR$Efficiency_target <- as.numeric(data_qPCR$Efficiency_target)
+data_qPCR$Efficiency_control <- as.numeric(data_qPCR$Efficiency_control)
+
+# data_qPCR$RelAbundance <- ((data_qPCR$Efficiency_target^(-data_qPCR$Cq))/(data_qPCR$Efficiency_control^(-data_qPCR$Cq_control)))
+
+data_qPCR$RelAbundance <- ((data_qPCR$Efficiency_target^(-data_qPCR$Cq)) / (data_qPCR$Efficiency_control^(-data_qPCR$Cq_control)))
+
+
+```
+```{r}
+data_qPCR$sample_target_control1 <- paste(data_qPCR$sample_control1,"; ",data_qPCR$target,sep = "")
+
+
+# Step 1 & 2: Filter rows where sample_target_control1 equals sample_target and select Cq
+matching_Cq_data <- data_qPCR %>%
+  filter(sample_target_control1 == sample_target) %>%
+  select(sample_target_control1, RelAbundance)  # Assuming you want to keep the sample and target columns
+
+matching_Cq_data <- matching_Cq_data %>%
+  rename(RelAbundance_control = RelAbundance)
+
+data_qPCR <- data_qPCR %>%
+  left_join(matching_Cq_data, by = "sample_target_control1")
+
+
+
+data_qPCR$FC <- data_qPCR$RelAbundance/data_qPCR$RelAbundance_control
+```
+
+
+```{r Prism Save}
+data_qPCR_PRISM <- data_qPCR %>%
+  select(c(sample, target,FC)) %>%
+  na.omit()
+data_qPCR_PRISM <- pivot_wider(data_qPCR_PRISM,
+                    names_from = sample, values_from = FC,
+                    values_fill = 0)
+
+
+# write.csv(summary_RI,
+#           file='20221207_MergedRMATs-Encode-Public-Shechter_Summary-RI_FDR-filtered.csv',
+#           row.names = FALSE
+#           )
+write.csv(data_qPCR_PRISM,
+          file=paste("4-data_processed/",exp,'_DataForPrism.csv', sep =""),
+          row.names = FALSE)
+
+
+```
+
+
+```{r, eval = FALSE}
+library(dplyr)
+
+# Calculate average Cq per Sample, assuming Cq is already numeric
+# data_summary <- data %>%
+#   group_by(Sample) %>%
+#   summarise(Avg_Cq = mean(Cq, na.rm = TRUE))
+
+library(ggplot2)
+
+# Plotting
+ggplot(data_filtered, aes(x = Sample, y = Relative_Difference, fill = Sample)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Average Cq Values by Sample",
+       x = "Sample",
+       y = "Average Cq",
+       fill = "Sample") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) # Rotate x-axis labels for readability
+  # facet_grid()
+
+
+```
+
